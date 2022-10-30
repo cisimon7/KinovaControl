@@ -1,0 +1,4 @@
+.fleet/
+.git/
+venv/
+.DS_Store

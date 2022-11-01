@@ -28,7 +28,7 @@ server = raisim.RaisimServer(world)
 server.launchServer(8080)
 server.focusOn(kinova)
 
-for i in range(500_000):
+for i in range(10_000_000):
     time.sleep(0.001)
     server.integrateWorldThreadSafe()
 

@@ -156,9 +156,11 @@ def R2Euler(R: Tensor):
     return (th.atan2(l_norm, R[0, 0] + R[1, 1] + R[2, 2]) / l_norm) * l
 
 
-def inverse_skew(R: Tensor):
+def inverse_skew(R: Tensor, check=True):
     assert R.shape == th.Size([3, 3]), f"Matrix of shape {R.shape} is not a rotation matrix"
-    is_skew_symmetric = th.allclose(R.transpose(dim0=0, dim1=1), -R, atol=1e-04)
-    # assert is_skew_symmetric, f"Matrix \n{R.round(decimals=4)}\n is not skew symmetric"
+
+    if check:
+        assert th.allclose(R.transpose(dim0=0, dim1=1), -R, atol=1e-04), \
+        f"Matrix \n{R.round(decimals=4)}\n is not skew symmetric"
 
     return th.vstack([R[2, 1], R[0, 2], R[1, 0]])

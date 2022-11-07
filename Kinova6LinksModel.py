@@ -1,8 +1,10 @@
+from BenchMarker import *
+from functools import reduce, partial
 from typing import List, Tuple
 from Transformations import *
-from functools import reduce
 from torch import Tensor
 import torch as th
+import functorch
 
 
 class Kinova6Links:
@@ -28,15 +30,24 @@ class Kinova6Links:
 
         return FK, links
 
-    def __jacobian_forward_kinematics(self, config: Tensor):
+    def __jacobian_fk(self, config: Tensor):
         jacobian = th.autograd.functional.jacobian(
             lambda tensor: self.__forward_kinematics(tensor)[0],
             config
-        ).transpose(dim0=0, dim1=2)
+        ).transpose(dim0=0, dim1=2).transpose(dim0=1, dim1=2)
 
         return jacobian
 
-    def __hessian_forward_kinematics(self, config: Tensor):
+    def jacobian_product_fk(self, config: Tensor, config_vel: Tensor):
+        fk_v = th.autograd.functional.jvp(
+            lambda tensor: self.__forward_kinematics(tensor)[0],
+            config,
+            config_vel
+        )
+
+        return fk_v
+
+    def __hessian_fk(self, config: Tensor):
         hessian = th.autograd.functional.hessian(
             lambda tensor: self.__forward_kinematics(tensor)[0],
             config
@@ -65,13 +76,22 @@ class Kinova6Links:
         FK = self.forward_kinematics(config, decompose=False)
         R, _ = T2RP(FK)
 
-        dT_dConfig = self.__jacobian_forward_kinematics(config)
-        dRs, dPs = zip(*[T2RP(dT) for dT in dT_dConfig]) # TODO(Look into using vmap here)
+        dT_dConfig = self.__jacobian_fk(config)
+        dRs, dPs = zip(*[T2RP(dT) for dT in dT_dConfig])  # TODO(Look into using vmap here)
         Jvs = th.hstack(dPs)
-        Jws = th.hstack([
-            inverse_skew(dR @ th.transpose(R, dim0=0, dim1=1))
-            for dR in dRs
-        ])  # TODO(Broadcasting should be able to work here)
+
+        # Unsafe because doesn't check for skew-symmetry, but faster because of vmap and unchecking,
+        # hence best to use in real time application
+        Jws = (functorch
+               .vmap(partial(inverse_skew, check=False))(th.stack(dRs) @ th.transpose(R, dim0=0, dim1=1))
+               .squeeze(dim=2)
+               .transpose(dim0=0, dim1=1))
+
+        # This is safer as it checks the skew-symmetry, best to use this in test case
+        # Jws = th.hstack([
+        #     inverse_skew(dR @ th.transpose(R, dim0=0, dim1=1))
+        #     for dR in dRs
+        # ])
 
         return th.vstack([Jvs, Jws])
 
@@ -82,7 +102,7 @@ class Kinova6Links:
         FK = self.forward_kinematics(config, decompose=False)
         R, P = T2RP(FK)
 
-        ddT_dConfig = self.__hessian_forward_kinematics(config)
+        ddT_dConfig = self.__hessian_fk(config)
         ddRs, ddPs = zip(*[T2RP(dT) for dT in ddT_dConfig])
         Hvs = th.hstack(ddPs)
         Hws = th.hstack([
@@ -91,6 +111,19 @@ class Kinova6Links:
         ])
 
         return th.vstack([Hvs, Hws])
+
+    def pos_vel(self, config: Tensor, config_vel: Tensor):
+        """
+        Taking advantage of Pytorch jvp to compute velocities faster. Might need to show equations prooving this
+        is allowed, or simply test case to proove this
+        :return the position and velocity of the end-effector for a given configuration and configuration velocity
+        """
+        FK, Vs = self.jacobian_product_fk(config, config_vel)
+        R, P = T2RP(FK)
+        theta = R2Euler(R)
+        Vr, Vt = T2RP(Vs)
+
+        return th.vstack([P, theta]), th.vstack([Vt, inverse_skew(Vr @ th.transpose(R, dim0=0, dim1=1))])
 
     def inverse_kinematics(self):
         pass
@@ -103,6 +136,16 @@ class Kinova6Links:
 
 
 if __name__ == '__main__':
+    config = th.rand(6)
+    vel = th.rand(6)
     manipulator = Kinova6Links()
-    print(manipulator.forward_kinematics(decompose=False).round(decimals=4))
-    print(manipulator.jacobian(th.rand(6)).round(decimals=4))
+
+    duration, value = time_it(
+        lambda: manipulator.pos_vel(config, vel)
+    )
+    print(f"Duration: {duration}\nValue: {value}\n")
+
+    duration, value = time_it(
+        lambda: (manipulator.forward_kinematics(config), manipulator.jacobian(config) @ vel)
+    )
+    print(f"Duration: {duration}\nValue: {value}")

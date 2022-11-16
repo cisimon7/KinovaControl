@@ -7,6 +7,7 @@ from BenchMarker import *
 if __name__ == '__main__':
     config = th.rand(6)
     vel = th.rand(6)
+
     manipulator = Kinova6Links()
 
     duration, value = time_it(
@@ -16,8 +17,11 @@ if __name__ == '__main__':
 
     duration, value = time_it(
         lambda: (
-            th.vstack(manipulator.forward_kinematics(config)),
+            th.vstack(manipulator.forward_kinematics(config)).ravel(),
             manipulator.jacobian(config) @ vel
         )
     )
     print(f"Duration:\n {duration}\nValue:\n {value}")
+
+    print(manipulator.mass_matrix(config).round())
+    print(manipulator.kinetic_energy(config, vel))

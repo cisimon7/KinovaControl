@@ -7,8 +7,7 @@ import torch as th
 
 class Kinova6Links:
     def __init__(self, config: Tensor = Tensor([0 for _ in range(6)])):
-        self.config = config
-        self.dof = 6
+        self.config, self.dof = config, 6
         self.masses = [th.tensor(0) for _ in range(6)]
         self.inertias = [th.eye(3) for _ in range(6)]
         self.lengths = [0.2755, 0.4100, 0.2073, 0.1038, 0.1038, 0.1600]
@@ -19,7 +18,6 @@ class Kinova6Links:
         T34 = lambda b4_, q4_: TTz(th.tensor(b4_)) @ TRz(q4_)
         T45 = lambda b5_, q5_: TTz(th.tensor(b5_)) @ TRy(q5_)
         T56 = lambda b6_, q6_: TTz(th.tensor(b6_)) @ TRz(q6_)
-
         self.ETS = [T01, T12, T23, T34, T45, T56]  # Elementary Transform sequence for the KINOVA robot
 
     def __forward_kinematics_end(self, config: Tensor, end=6) -> Tensor:
@@ -35,27 +33,16 @@ class Kinova6Links:
             FK = FK @ self.ETS[i](self.lengths[i], config[i])
 
         FK = FK @ self.ETS[center - 1](0.5 * self.lengths[center - 1], config[center - 1])
-
         return FK
 
     def __jacobian_fk(self, config: Tensor, fk_fun=None):
-        forward_kinematics_fun = self.__forward_kinematics_end if fk_fun is None else fk_fun
+        forward_kinematics_func = self.__forward_kinematics_end if fk_fun is None else fk_fun
         jacobian = th.autograd.functional.jacobian(
-            lambda tensor: forward_kinematics_fun(tensor),
+            lambda tensor: forward_kinematics_func(tensor),
             config
-        ).permute(2, 1, 0)
+        ).permute(2, 0, 1)
 
         return jacobian
-
-    def jacobian_product_fk(self, config: Tensor, config_vel: Tensor, fk_fun=None):
-        forward_kinematics_fun = self.__forward_kinematics_end if fk_fun is None else fk_fun
-        fk_v = th.autograd.functional.jvp(
-            lambda tensor: forward_kinematics_fun(tensor),
-            config,
-            config_vel
-        )
-
-        return fk_v
 
     def __hessian_fk(self, config: Tensor):
         hessian = th.autograd.functional.hessian(
@@ -78,38 +65,55 @@ class Kinova6Links:
 
         return th.round(P, decimals=4), th.round(euler_angles, decimals=4)
 
+    def dconf2Jac(self, d_config: Tensor, R: Tensor):
+        dRs, dPs = zip(*[T2RP(dT) for dT in d_config])  # TODO(Look into using vmap here)
+        Jvs = th.hstack(dPs)  # TODO(th.hstack may create a new tensor which makes derivative not possible)
+
+        # Unsafe because doesn't check for skew-symmetry, but faster because of vmap and unchecking,
+        # hence best to use in real time application
+        Jws = fth.vmap(partial(inverse_skew, check=False))(
+            th.stack(dRs) @ th.transpose(R, dim0=0, dim1=1)
+        ).squeeze(dim=2).transpose(dim0=0, dim1=1)
+
+        # This is safer as it checks the skew-symmetry, best to use this in test case
+        # Jws = th.hstack([
+        #     inverse_skew(dR @ th.transpose(R, dim0=0, dim1=1))
+        #     for dR in dRs
+        # ])
+
+        return th.vstack([Jvs, Jws])
+
     def jacobian(self, config: Tensor = None):
         config = self.config if config is None else config
         assert config.shape == th.Size([6]), f"Kinova Manipulator has only 7 joints, not {config.shape}"
 
         FK = self.__forward_kinematics_end(config)
         R, _ = T2RP(FK)
-
         dT_dConfig = self.__jacobian_fk(config)
-        dRs, dPs = zip(*[T2RP(dT) for dT in dT_dConfig])  # TODO(Look into using vmap here)
-        Jvs = th.hstack(dPs)  # TODO(th.hstack may create a new tensor which makes derivative not possible)
 
-        # Unsafe because doesn't check for skew-symmetry, but faster because of vmap and unchecking,
-        # hence best to use in real time application
-        # Jws = fth.vmap(partial(inverse_skew, check=False))(
-        #     th.stack(dRs) @ th.transpose(R, dim0=0, dim1=1)
-        # ).squeeze(dim=2).transpose(dim0=0, dim1=1)
-
-        # This is safer as it checks the skew-symmetry, best to use this in test case
-        Jws = th.hstack([
-            inverse_skew(dR @ th.transpose(R, dim0=0, dim1=1))
-            for dR in dRs
-        ])
-
-        return th.vstack([Jvs, Jws])
+        return self.dconf2Jac(dT_dConfig, R)
 
     def jacobian_centers(self, config: Tensor):
-        FK_centers = [partial(self.__forward_kinematics_end(), level=i) for i in range(self.dof - 1)]
+        funcs = [partial(self.__forward_kinematics_center, center=i) for i in range(self.dof)]
+        FK_cs = [func(config) for func in funcs]
+        d_configs = [self.__jacobian_fk(config, func) for func in funcs]
+        R_cs, _ = zip(*[T2RP(T) for T in FK_cs])
 
-        J_cis, FK_cis = 0, 0
-        R_cis = FK_cis
+        J_cs = fth.vmap(self.dconf2Jac)(
+            th.stack(d_configs), th.stack(R_cs)  # Todo(check this does not create a new tensor)
+        )
 
-        return J_cis, R_cis
+        return J_cs, th.stack(R_cs)
+
+    def jacobian_product_fk(self, config: Tensor, config_vel: Tensor, fk_fun=None):
+        forward_kinematics_func = self.__forward_kinematics_end if fk_fun is None else fk_fun
+        fk_v = th.autograd.functional.jvp(
+            lambda tensor: forward_kinematics_func(tensor),
+            config,
+            config_vel
+        )
+
+        return fk_v
 
     def hessian(self, config: Tensor = None):
         config = self.config if config is None else config
@@ -146,7 +150,7 @@ class Kinova6Links:
 
     def mass_matrix(self, config: Tensor):
         def link_mass_matrix(m_i, J_i, R_i, I_i):
-            J_i.transpose(dim0=0, dim1=1) @ th.vstack([
+            return J_i.transpose(dim0=0, dim1=1) @ th.vstack([
                 th.hstack([m_i * th.eye(3), th.zeros((3, 3))]),
                 th.hstack([th.zeros((3, 3)), R_i.transpose(dim0=0, dim1=1) @ I_i @ R_i])
             ]) @ J_i
@@ -154,7 +158,7 @@ class Kinova6Links:
         J_cs, Rs = self.jacobian_centers(config)
 
         return fth.vmap(link_mass_matrix)(
-            th.vstack(self.masses), J_cs, Rs, th.vstack(self.inertias)
+            th.stack(self.masses), J_cs, Rs, th.stack(self.inertias)
         ).sum(dim=0)
 
     def corriolis_centrifugal(self, config: Tensor, M: Tensor = None):
@@ -165,7 +169,7 @@ class Kinova6Links:
 
     def kinetic_energy(self, config: Tensor, config_vel: Tensor):
         M = self.mass_matrix(config)
-        return 0.5 * config_vel.transpose(0, 1) @ M @ config_vel
+        return 0.5 * config_vel.transpose(0, -1) @ M @ config_vel
 
     def potential_energy(self, config: Tensor):
         def link_potential(m, g, z):
@@ -193,3 +197,5 @@ class Kinova6Links:
                 gravity_term +  # G(q)
                 (J_ee @ wrench)  # J(q) * F_tip
         )
+
+# TODO(Pytorch way of saving functions, similiar to jit, so as the tensor graph doesn't have to recreated on each call)
